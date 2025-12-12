@@ -1,70 +1,51 @@
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, PlaywrightURLLoader
+import asyncio
 from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_text_splitters import CharacterTextSplitter
+
+from prompts import (
+    clean_text_system_prompt,
+    clean_text_human_prompt,
+    translate_text_system_prompt,
+    translate_text_human_prompt,
+)
 
 load_dotenv()
 
-clean_text_system_prompt = """
-    The input text is extracted from a PDF. Process the text following rules below:
-    - The text contains formatting errors, broken lines, unnecessary whitespace, page numbers, footnotes, endnotes, and footers. Please ignore these artifacts, reconstruct the correct sentences.
-    - The output should remain same paragraph structure as the input. If part of the text is considered as a heading and a paragraph, keep the heading and the paragraph together with a line break in between. If part of the text is considered as a list, keep the list together with a line break in between.
-    - The text may be written in a mixed language of English and Chinese(Traditional). Keep the original language of the text. Don't translate the text.
-    - Remove the content of tables and images, yet remain the captions of tables and images.
-    - For the text which are programming code blocks, delimit the code blocks with ```.
-    - For the text which is part of math equations, delimit the math equations with $$.
-    """
 
-clean_text_human_prompt = """
-    Given the text delimited by ```, clean it according to the rules.
-    Return only the cleaned text, no other text or comments.
-    ```
-    {pdf_text}
-    ```
-    """
+async def main():
+    # print("Loading PDF...")
+    # pdf_loader = PyPDFLoader("data/ai-system-evaluation-criteria.pdf")
+    # pdf_docs = pdf_loader.load()
+    # print(f"Loaded {len(pdf_docs)} pages")
 
-translate_text_system_prompt = """
-Instruction / Persona:
-你是一位專業譯者，擅長軟體類書籍的英翻中翻譯，翻譯風格偏重於：
-- 忠實保留原文結構與內容，逐句逐段翻譯，不刪減、不意譯。
-- 人名保持英文原文，例如 Leslie Lamport。
-- 任何技術類專有名詞應保留英文原文，僅在首次出現時，在英文後面加上括號，括號內為中文翻譯，例如 "Prompt Engineering (提示詞工程)"。
-- 程式碼、CLI 指令會以 ``` 包裹，僅翻譯程式碼中的註釋，不要翻譯程式碼中的程式碼。
-- 翻譯必須讓中文讀者讀起來流暢自然，同時能對照英文概念。
+    web_docs_url = "https://papiers.ai/1706.03762?referrer=luma"
+    web_loader = PlaywrightURLLoader(
+        [web_docs_url], remove_selectors=["header", "footer", "aside"]
+    )
+    web_docs = await web_loader.aload()
+    print(f"Loaded {len(web_docs)} pages")
 
-Behavior Rules:
-- 當使用者貼上英文段落時，一次完整翻譯整段，不可省略或跳段。
-- 不要自行提問「是否要繼續翻譯下一段」，只翻譯使用者提供的內容。
-- 翻譯結果要符合「技術書籍出版品質」，避免口語化或過度意譯。
+    # selected_pages = pdf_docs[:]
+    # pdf_text_page_contents = [page.page_content for page in selected_pages]
 
-Example:
-- User input: ```The CAP theorem was initially a conjecture made by computer scientist Eric Brewer...```
-- Assistant response: ```The CAP theorem 最初是電腦科學家 Eric Brewer 提出的猜想...```
-    """
-
-translate_text_human_prompt = """
-    Given the text delimited by ```, translate it according to the rules.
-    Return only the translated text, no other text or comments.
-    ```
-    {cleaned_text}
-    ```
-    """
-
-
-def main():
-    print("Loading PDF...")
-    loader = PyPDFLoader("data/ai-system-evaluation-criteria.pdf")
-    docs = loader.load()
-    print(f"Loaded {len(docs)} pages")
-
-    selected_pages = docs[1:4]
-    pdf_text_page_contents = [page.page_content for page in selected_pages]
+    web_text_page_contents = [page.page_content for page in web_docs]
 
     # LLM 1: Clean text extracted from
-    gemini_2_5_flash = init_chat_model(
+    # gemini_2_5_flash = init_chat_model(
+    #     model_provider="google_genai",
+    #     model="gemini-2.5-flash",
+    #     temperature=0.0,
+    #     max_retries=10,
+    # )
+
+    gemini_2_5_pro = init_chat_model(
         model_provider="google_genai",
-        model="gemini-2.5-flash",
+        model="gemini-2.5-pro",
         temperature=0.0,
+        max_retries=10,
     )
     clean_text_prompt = ChatPromptTemplate(
         [
@@ -72,29 +53,60 @@ def main():
             ("user", clean_text_human_prompt),
         ]
     )
-    clean_text_chain = clean_text_prompt | gemini_2_5_flash
+    clean_text_chain = clean_text_prompt | gemini_2_5_pro
+
+    # Merge text from multiple pages and split text into paragraphs for translation
+    merged_text = []
+    # responses = await clean_text_chain.abatch(
+    #     pdf_text_page_contents, max_concurrency=20, return_exceptions=True
+    # )
+
+    responses = await clean_text_chain.abatch(
+        web_text_page_contents, max_concurrency=20, return_exceptions=True
+    )
+
+    for response in responses:
+        if response.content[-1] == ".":
+            cleaned_text = response.content + "\n"
+        else:
+            cleaned_text = response.content
+        merged_text.append(cleaned_text)
+    merged_text = " ".join(merged_text)
+
+    text_splitter = CharacterTextSplitter(
+        separator="\n\n",
+        chunk_size=5000,
+        chunk_overlap=0,
+        length_function=len,
+    )
+    paragraphs = text_splitter.split_text(merged_text)
+    for paragraph in paragraphs:
+        print(paragraph)
+        print("-" * 100)
 
     # LLM 2: Translate text
-    gpt_4o = init_chat_model(
-        model_provider="openai",
-        model="gpt-4o",
-        temperature=0.0,
-    )
     translate_text_prompt = ChatPromptTemplate(
         [
             ("system", translate_text_system_prompt),
             ("user", translate_text_human_prompt),
         ]
     )
-    translate_text_chain = translate_text_prompt | gpt_4o
+    translate_text_chain = translate_text_prompt | gemini_2_5_pro
 
-    full_text_chain = clean_text_chain | translate_text_chain
+    responses = await translate_text_chain.abatch(
+        [{"cleaned_paragraph": paragraph} for paragraph in paragraphs],
+        max_concurrency=20,
+        return_exceptions=True,
+    )
+    translated_article = "\n\n".join([response.content for response in responses])
 
-    for page_content in pdf_text_page_contents:
-        translated_text = full_text_chain.invoke({"pdf_text": page_content})
-        print("-" * 50)
-        print(translated_text.content)
+    # Save translated article to file
+    with open(
+        "output/v11_web_page_2.5_pro.md",
+        "w",
+    ) as f:
+        f.write(translated_article)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
